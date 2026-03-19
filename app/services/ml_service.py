@@ -2,14 +2,12 @@ from collections import defaultdict
 from datetime import datetime
 
 from app.db import get_connection
-from app.ml.synthetic_data import DATASET_PATH, generate_synthetic_dataset
 from app.ml.training import load_classifier, load_forecast_bundle, load_metrics, train_ml_models
 from app.services.finance_service import category_meta, currency
 
 
 def ensure_ml_assets():
-    generate_synthetic_dataset()
-    return train_ml_models()
+    return load_metrics()
 
 
 def _amount_bucket(amount: float):
@@ -71,9 +69,10 @@ def classify_expense_payload(payload):
     classifier = load_classifier()
     if classifier is None:
         return {
-            'status': metrics.get('status', 'dependencies_missing'),
-            'message': metrics.get('message', 'ML-модель пока недоступна.'),
-            'datasetPath': str(DATASET_PATH),
+            'status': metrics.get('status', 'not_trained'),
+            'message': metrics.get('message', 'ML-модель пока не обучена на реальных данных.'),
+            'models': metrics.get('models', {}),
+            'dataset': metrics.get('dataset', {}),
         }
 
     features = [
@@ -153,7 +152,7 @@ def _status_by_ratio(ratio: float):
 
 
 def user_ml_overview_payload(user_id: int):
-    metrics = ensure_ml_assets()
+    metrics = load_metrics()
     monthly_rows = _user_monthly_expenses(user_id)
     budget_map = _user_budget_map(user_id)
     forecast_bundle = load_forecast_bundle()
@@ -161,11 +160,11 @@ def user_ml_overview_payload(user_id: int):
     if not monthly_rows:
         return {
             'status': metrics.get('status', 'no_data'),
-            'dataset': metrics.get('dataset', {'datasetPath': str(DATASET_PATH)}),
+            'dataset': metrics.get('dataset', {}),
             'models': metrics.get('models', {}),
             'forecast': [],
             'insights': ['Недостаточно реальных расходов пользователя для прогноза.'],
-            'message': metrics.get('message', 'Сначала добавьте расходы пользователя.'),
+            'message': 'Сначала добавьте реальные расходы пользователя.',
         }
 
     grouped = defaultdict(dict)
@@ -219,7 +218,7 @@ def user_ml_overview_payload(user_id: int):
 
     insights = [
         f'На следующий период модель ожидает самые высокие расходы в категории «{top_forecast}».',
-        f'Синтетический датасет для обучения содержит {metrics.get("dataset", {}).get("records", 0)} записей.',
+        f'Для обучения использовано {metrics.get("dataset", {}).get("records", 0)} реальных записей транзакций.',
     ]
     if risk_items:
         insights.append(f'Есть {len(risk_items)} категории с риском приближения к лимиту бюджета.')
@@ -227,13 +226,13 @@ def user_ml_overview_payload(user_id: int):
         insights.append('По текущему прогнозу критичных превышений бюджета не ожидается.')
 
     return {
-        'status': metrics.get('status', 'ready'),
-        'dataset': metrics.get('dataset', {'datasetPath': str(DATASET_PATH)}),
+        'status': metrics.get('status', 'not_trained'),
+        'dataset': metrics.get('dataset', {}),
         'models': metrics.get('models', {}),
         'forecastMonth': next_month,
         'forecast': forecast_items,
         'insights': insights,
-        'message': metrics.get('message', 'ML-аналитика подготовлена.'),
+        'message': metrics.get('message', 'ML-аналитика подготовлена на реальных данных.'),
     }
 
 

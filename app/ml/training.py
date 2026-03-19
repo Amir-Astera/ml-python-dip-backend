@@ -1,13 +1,15 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 from json import dump, load
 from pathlib import Path
 import pickle
 
-from app.ml.synthetic_data import DATA_DIR, DATASET_PATH, generate_synthetic_dataset, load_synthetic_rows
+from app.db import get_connection
+from app.ml.synthetic_data import DATA_DIR
 
 CLASSIFIER_PATH = DATA_DIR / 'expense_classifier.pkl'
 FORECAST_PATH = DATA_DIR / 'expense_forecast.pkl'
 METRICS_PATH = DATA_DIR / 'ml_metrics.json'
+REAL_DATASET_SOURCE = 'postgres_transactions'
 
 
 def _safe_import_ml_dependencies():
@@ -47,6 +49,63 @@ def _amount_bucket(amount: float):
     return 'xlarge'
 
 
+def _income_band(avg_income: float):
+    if avg_income < 250000:
+        return 'low'
+    if avg_income < 400000:
+        return 'medium'
+    if avg_income < 600000:
+        return 'medium_high'
+    return 'high'
+
+
+def _load_real_rows():
+    with get_connection() as connection:
+        income_rows = connection.execute(
+            """
+            SELECT user_id, AVG(monthly_income) AS avg_income
+            FROM (
+                SELECT user_id, substr(tx_date, 1, 7) AS month_key, SUM(amount) AS monthly_income
+                FROM transactions
+                WHERE tx_type = 'income'
+                GROUP BY user_id, substr(tx_date, 1, 7)
+            ) income_by_month
+            GROUP BY user_id
+            """
+        ).fetchall()
+        transaction_rows = connection.execute(
+            """
+            SELECT id, user_id, title, COALESCE(note, '') AS note, category, tx_type, amount, tx_date
+            FROM transactions
+            ORDER BY user_id ASC, tx_date ASC, id ASC
+            """
+        ).fetchall()
+
+    income_map = {
+        row['user_id']: float(row['avg_income']) if row['avg_income'] is not None else 0.0 for row in income_rows
+    }
+    rows = []
+    for row in transaction_rows:
+        year = int(row['tx_date'][0:4])
+        month = int(row['tx_date'][5:7])
+        rows.append(
+            {
+                'user_id': row['user_id'],
+                'profile': 'app_user',
+                'income_band': _income_band(income_map.get(row['user_id'], 0.0)),
+                'tx_type': row['tx_type'],
+                'title': row['title'],
+                'note': row['note'] or '',
+                'category': row['category'],
+                'amount': float(row['amount']),
+                'tx_date': row['tx_date'],
+                'year': year,
+                'month': month,
+            }
+        )
+    return rows
+
+
 def _expense_text(row):
     return ' | '.join(
         [
@@ -83,7 +142,7 @@ def _build_forecast_dataset(rows):
     profile_map = {}
 
     for row in expense_rows:
-        key = (row['synthetic_user_id'], row['category'])
+        key = (row['user_id'], row['category'])
         month_key = f"{row['year']}-{int(row['month']):02d}"
         grouped[key][month_key] += float(row['amount'])
         profile_map[key] = {
@@ -123,10 +182,10 @@ def _build_forecast_dataset(rows):
 def _dataset_stats(rows):
     expense_rows = [row for row in rows if row['tx_type'] == 'expense']
     return {
-        'datasetPath': str(DATASET_PATH),
+        'source': REAL_DATASET_SOURCE,
         'records': len(rows),
         'expenseRecords': len(expense_rows),
-        'syntheticUsers': len({row['synthetic_user_id'] for row in rows}),
+        'users': len({row['user_id'] for row in rows}),
         'categories': sorted({row['category'] for row in expense_rows}),
     }
 
@@ -135,6 +194,11 @@ def _save_pickle(path: Path, payload):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with path.open('wb') as file:
         pickle.dump(payload, file)
+
+
+def _remove_if_exists(path: Path):
+    if path.exists():
+        path.unlink()
 
 
 def _load_pickle(path: Path):
@@ -156,24 +220,27 @@ def load_metrics():
 
 
 def train_ml_models(force: bool = False):
-    dataset_path = generate_synthetic_dataset()
-    rows = load_synthetic_rows(dataset_path)
+    rows = _load_real_rows()
     stats = _dataset_stats(rows)
     deps = _safe_import_ml_dependencies()
 
     if deps is None:
+        _remove_if_exists(CLASSIFIER_PATH)
+        _remove_if_exists(FORECAST_PATH)
         result = {
             'status': 'dependencies_missing',
             'dataset': stats,
             'message': 'Для обучения моделей нужно установить scikit-learn.',
+            'models': {},
         }
         _save_metrics(result)
         return result
 
-    if not force and CLASSIFIER_PATH.exists() and FORECAST_PATH.exists() and METRICS_PATH.exists():
+    if not force and METRICS_PATH.exists():
         cached = load_metrics()
-        cached.setdefault('dataset', stats)
-        return cached
+        if cached.get('dataset', {}).get('source') == REAL_DATASET_SOURCE:
+            cached.setdefault('dataset', stats)
+            return cached
 
     x_cls, y_cls = _build_classifier_dataset(rows)
     train_test_split = deps['train_test_split']
@@ -181,83 +248,126 @@ def train_ml_models(force: bool = False):
     Pipeline = deps['Pipeline']
     TfidfVectorizer = deps['TfidfVectorizer']
     LogisticRegression = deps['LogisticRegression']
-
-    x_train_cls, x_test_cls, y_train_cls, y_test_cls = train_test_split(
-        x_cls,
-        y_cls,
-        test_size=0.2,
-        random_state=42,
-        stratify=y_cls,
+    classifier_metrics = {
+        'status': 'insufficient_data',
+        'message': 'Для обучения классификатора нужны реальные размеченные расходы минимум в 2 категориях.',
+    }
+    class_counts = Counter(y_cls)
+    can_train_classifier = (
+        len(x_cls) >= 12 and len(class_counts) >= 2 and class_counts and min(class_counts.values()) >= 2
     )
-    classifier = Pipeline(
-        [
-            ('vectorizer', TfidfVectorizer(ngram_range=(1, 2))),
-            ('model', LogisticRegression(max_iter=1500)),
-        ]
-    )
-    classifier.fit(x_train_cls, y_train_cls)
-    cls_predictions = classifier.predict(x_test_cls)
-    classifier_accuracy = accuracy_score(y_test_cls, cls_predictions)
-    _save_pickle(CLASSIFIER_PATH, classifier)
 
-    x_forecast, y_forecast = _build_forecast_dataset(rows)
-    x_train_fc, x_test_fc, y_train_fc, y_test_fc = train_test_split(
-        x_forecast,
-        y_forecast,
-        test_size=0.2,
-        random_state=42,
-    )
-    DictVectorizer = deps['DictVectorizer']
-    RandomForestRegressor = deps['RandomForestRegressor']
-    mean_absolute_error = deps['mean_absolute_error']
-    r2_score = deps['r2_score']
-
-    forecast_vectorizer = DictVectorizer(sparse=False)
-    x_train_fc_vectorized = forecast_vectorizer.fit_transform(x_train_fc)
-    x_test_fc_vectorized = forecast_vectorizer.transform(x_test_fc)
-    forecast_model = RandomForestRegressor(n_estimators=180, random_state=42)
-    forecast_model.fit(x_train_fc_vectorized, y_train_fc)
-    fc_predictions = forecast_model.predict(x_test_fc_vectorized)
-    forecast_mae = mean_absolute_error(y_test_fc, fc_predictions)
-    forecast_r2 = r2_score(y_test_fc, fc_predictions)
-    _save_pickle(FORECAST_PATH, {'vectorizer': forecast_vectorizer, 'model': forecast_model})
-
-    metrics = {
-        'status': 'ready',
-        'dataset': stats,
-        'models': {
-            'classifier': {
+    if can_train_classifier:
+        try:
+            x_train_cls, x_test_cls, y_train_cls, y_test_cls = train_test_split(
+                x_cls,
+                y_cls,
+                test_size=0.2,
+                random_state=42,
+                stratify=y_cls,
+            )
+            classifier = Pipeline(
+                [
+                    ('vectorizer', TfidfVectorizer(ngram_range=(1, 2))),
+                    ('model', LogisticRegression(max_iter=1500)),
+                ]
+            )
+            classifier.fit(x_train_cls, y_train_cls)
+            cls_predictions = classifier.predict(x_test_cls)
+            classifier_accuracy = accuracy_score(y_test_cls, cls_predictions)
+            _save_pickle(CLASSIFIER_PATH, classifier)
+            classifier_metrics = {
+                'status': 'ready',
                 'algorithm': 'LogisticRegression + TF-IDF',
                 'accuracy': round(float(classifier_accuracy), 4),
                 'classes': sorted(set(y_cls)),
                 'trainSamples': len(x_train_cls),
                 'testSamples': len(x_test_cls),
-            },
-            'forecast': {
+            }
+        except ValueError:
+            _remove_if_exists(CLASSIFIER_PATH)
+    else:
+        _remove_if_exists(CLASSIFIER_PATH)
+
+    x_forecast, y_forecast = _build_forecast_dataset(rows)
+    DictVectorizer = deps['DictVectorizer']
+    RandomForestRegressor = deps['RandomForestRegressor']
+    mean_absolute_error = deps['mean_absolute_error']
+    r2_score = deps['r2_score']
+    forecast_metrics = {
+        'status': 'insufficient_data',
+        'message': 'Для прогноза нужны реальные расходы минимум за несколько месяцев.',
+    }
+
+    if len(x_forecast) >= 8:
+        try:
+            x_train_fc, x_test_fc, y_train_fc, y_test_fc = train_test_split(
+                x_forecast,
+                y_forecast,
+                test_size=0.2,
+                random_state=42,
+            )
+            forecast_vectorizer = DictVectorizer(sparse=False)
+            x_train_fc_vectorized = forecast_vectorizer.fit_transform(x_train_fc)
+            x_test_fc_vectorized = forecast_vectorizer.transform(x_test_fc)
+            forecast_model = RandomForestRegressor(n_estimators=180, random_state=42)
+            forecast_model.fit(x_train_fc_vectorized, y_train_fc)
+            fc_predictions = forecast_model.predict(x_test_fc_vectorized)
+            forecast_mae = mean_absolute_error(y_test_fc, fc_predictions)
+            forecast_r2 = r2_score(y_test_fc, fc_predictions)
+            _save_pickle(FORECAST_PATH, {'vectorizer': forecast_vectorizer, 'model': forecast_model})
+            forecast_metrics = {
+                'status': 'ready',
                 'algorithm': 'RandomForestRegressor',
                 'mae': round(float(forecast_mae), 2),
                 'r2': round(float(forecast_r2), 4),
                 'trainSamples': len(x_train_fc),
                 'testSamples': len(x_test_fc),
-            },
+            }
+        except ValueError:
+            _remove_if_exists(FORECAST_PATH)
+    else:
+        _remove_if_exists(FORECAST_PATH)
+
+    ready_models = sum(
+        1 for item in (classifier_metrics, forecast_metrics) if item.get('status') == 'ready'
+    )
+    if ready_models == 2:
+        status = 'ready'
+        message = 'ML-модели обучены на реальных транзакциях пользователей.'
+    elif ready_models == 1:
+        status = 'partially_ready'
+        message = 'Часть ML-моделей обучена на реальных данных. Для полной аналитики нужно больше истории операций.'
+    else:
+        status = 'insufficient_data'
+        message = 'Для ML пока недостаточно реальных данных. Добавьте больше операций и затем запустите переобучение.'
+
+    metrics = {
+        'status': status,
+        'dataset': stats,
+        'models': {
+            'classifier': classifier_metrics,
+            'forecast': forecast_metrics,
         },
-        'message': 'ML-модели обучены на синтетическом датасете.',
+        'message': message,
     }
     _save_metrics(metrics)
     return metrics
 
 
 def load_classifier():
-    if not CLASSIFIER_PATH.exists():
-        train_ml_models()
+    metrics = load_metrics()
+    if metrics.get('dataset', {}).get('source') != REAL_DATASET_SOURCE:
+        return None
     if not CLASSIFIER_PATH.exists():
         return None
     return _load_pickle(CLASSIFIER_PATH)
 
 
 def load_forecast_bundle():
-    if not FORECAST_PATH.exists():
-        train_ml_models()
+    metrics = load_metrics()
+    if metrics.get('dataset', {}).get('source') != REAL_DATASET_SOURCE:
+        return None
     if not FORECAST_PATH.exists():
         return None
     return _load_pickle(FORECAST_PATH)

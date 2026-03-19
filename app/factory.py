@@ -8,8 +8,6 @@ from app.routers.budgets import router as budgets_router
 from app.routers.dashboard import router as dashboard_router
 from app.routers.ml import router as ml_router
 from app.routers.transactions import router as transactions_router
-from app.services.auth_service import ensure_default_user
-from app.services.ml_service import ensure_ml_assets
 
 
 def create_app():
@@ -26,8 +24,6 @@ def create_app():
     @app.on_event('startup')
     def startup_event():
         init_db()
-        ensure_default_user()
-        ensure_ml_assets()
 
     @app.get('/')
     def root():
