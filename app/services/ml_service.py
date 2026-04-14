@@ -2,7 +2,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from app.db import get_connection
-from app.ml.training import load_classifier, load_forecast_bundle, load_metrics, train_ml_models
+from app.ml.training import load_classifier, load_forecast_bundle, load_metrics, ml_retrain_readiness, train_ml_models
 from app.services.finance_service import category_meta, currency
 
 
@@ -165,6 +165,7 @@ def user_ml_overview_payload(user_id: int):
             'forecast': [],
             'insights': ['Недостаточно реальных расходов пользователя для прогноза.'],
             'message': 'Сначала добавьте реальные расходы пользователя.',
+            'mlRetrain': ml_retrain_readiness(),
         }
 
     grouped = defaultdict(dict)
@@ -233,6 +234,7 @@ def user_ml_overview_payload(user_id: int):
         'forecast': forecast_items,
         'insights': insights,
         'message': metrics.get('message', 'ML-аналитика подготовлена на реальных данных.'),
+        'mlRetrain': ml_retrain_readiness(),
     }
 
 

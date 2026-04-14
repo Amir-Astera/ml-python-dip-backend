@@ -2,7 +2,7 @@ from datetime import datetime
 
 from fastapi import HTTPException
 
-from app.constants import CATEGORY_META, MONTH_LABELS
+from app.constants import CATEGORY_META, DEFAULT_BUDGETS, MONTH_LABELS
 from app.db import get_connection
 
 
@@ -22,6 +22,41 @@ def month_label(month_key: str):
 def date_label(date_value: str, category: str):
     date_obj = datetime.strptime(date_value, "%Y-%m-%d")
     return f"{date_obj.day:02d} {MONTH_LABELS.get(date_obj.strftime('%m'))} {date_obj.year} • {category}"
+
+
+def _parse_analytics_date(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        datetime.strptime(stripped, "%Y-%m-%d")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Некорректная дата, ожидается формат YYYY-MM-DD") from error
+    return stripped
+
+
+def _normalize_analytics_range(date_from: str | None, date_to: str | None):
+    df = _parse_analytics_date(date_from)
+    dt = _parse_analytics_date(date_to)
+    if df and dt and df > dt:
+        return dt, df
+    return df, dt
+
+
+def _analytics_date_sql_fragment(date_from: str | None, date_to: str | None):
+    clauses = []
+    params: list = []
+    if date_from:
+        clauses.append("tx_date >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("tx_date <= ?")
+        params.append(date_to)
+    if not clauses:
+        return "", []
+    return " AND " + " AND ".join(clauses), params
 
 
 def category_meta(category: str):
@@ -65,7 +100,15 @@ def latest_period_for_user(user_id: int):
     return row["period"] or datetime.utcnow().strftime("%Y-%m")
 
 
-def fetch_transactions_for_user(user_id: int, search: str = "", category: str = "all"):
+def fetch_transactions_for_user(
+    user_id: int,
+    search: str = "",
+    category: str = "all",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    df, dt = _normalize_analytics_range(date_from, date_to)
+    date_frag, date_params = _analytics_date_sql_fragment(df, dt)
     query = "SELECT * FROM transactions WHERE user_id = ?"
     params = [user_id]
 
@@ -78,6 +121,9 @@ def fetch_transactions_for_user(user_id: int, search: str = "", category: str = 
         query += " AND category = ?"
         params.append(category)
 
+    query += date_frag
+    params.extend(date_params)
+
     query += " ORDER BY tx_date DESC, id DESC"
 
     with get_connection() as connection:
@@ -87,6 +133,12 @@ def fetch_transactions_for_user(user_id: int, search: str = "", category: str = 
 def serialize_transaction(row):
     meta = category_meta(row["category"])
     signed_amount = row["amount"] if row["tx_type"] == "income" else -row["amount"]
+    src = (row.get("income_source") or "").strip()
+    base_dl = date_label(row["tx_date"], row["category"])
+    if src and row["tx_type"] == "income":
+        date_dl = f"{base_dl} · {src}"
+    else:
+        date_dl = base_dl
     return {
         "id": row["id"],
         "title": row["title"],
@@ -95,8 +147,9 @@ def serialize_transaction(row):
         "amount": row["amount"],
         "amountLabel": currency(signed_amount, signed=True),
         "date": row["tx_date"],
-        "dateLabel": date_label(row["tx_date"], row["category"]),
+        "dateLabel": date_dl,
         "note": row["note"],
+        "incomeSource": src,
         "positive": row["tx_type"] == "income",
         "icon": meta["icon"],
         "iconColor": meta["iconColor"],
@@ -228,11 +281,21 @@ def dashboard_cashflow(user_id: int):
     max_value = max([max(row["income_total"], row["expense_total"]) for row in rows] or [1])
     result = []
     for row in rows:
+        inc_pct = max(8, round(row["income_total"] / max_value * 100))
+        exp_pct = max(8, round(row["expense_total"] / max_value * 100))
+        inc_l = currency(row["income_total"])
+        exp_l = currency(row["expense_total"])
         result.append(
             {
                 "label": month_label(row["month_key"]),
-                "income": f"{max(12, round(row['income_total'] / max_value * 100))}%",
-                "expense": f"{max(10, round(row['expense_total'] / max_value * 100))}%",
+                "monthKey": row["month_key"],
+                "income": f"{inc_pct}%",
+                "expense": f"{exp_pct}%",
+                "incomeLabel": inc_l,
+                "expenseLabel": exp_l,
+                "incomeTotal": float(row["income_total"]),
+                "expenseTotal": float(row["expense_total"]),
+                "barTitle": f"{month_label(row['month_key'])}: доход {inc_l}, расход {exp_l}",
             }
         )
     return result
@@ -287,15 +350,45 @@ def dashboard_insight(user_id: int):
             """,
             (user_id, latest_period),
         ).fetchone()
+        month_totals = connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN tx_type = 'income' THEN amount ELSE 0 END), 0) AS inc,
+                COALESCE(SUM(CASE WHEN tx_type = 'expense' THEN amount ELSE 0 END), 0) AS exp
+            FROM transactions
+            WHERE user_id = ? AND substr(tx_date, 1, 7) = ?
+            """,
+            (user_id, latest_period),
+        ).fetchone()
 
     if row is None:
         return "Пока недостаточно данных для анализа. Добавьте операции, и система построит рекомендации."
 
     ml_summary = ml_forecast_summary(user_id)
     if ml_summary:
-        return f"Самая крупная категория расходов в {month_label(latest_period)} — {row['category']}. ML-прогноз на {ml_summary['month']} показывает повышенную нагрузку по категории {ml_summary['topCategory']} на сумму {ml_summary['predictedLabel']}."
+        fallback = (
+            f"Самая крупная категория расходов в {month_label(latest_period)} — {row['category']}. "
+            f"ML-прогноз на {ml_summary['month']}: категория «{ml_summary['topCategory']}», ожидается {ml_summary['predictedLabel']}."
+        )
+    else:
+        fallback = (
+            f"Самая крупная категория расходов в {month_label(latest_period)} — {row['category']}. "
+            "Имеет смысл пересмотреть лимит по этой группе и оставить резерв на обязательные платежи."
+        )
 
-    return f"Самая крупная категория расходов в {month_label(latest_period)} — {row['category']}. Модель рекомендует пересмотреть лимит по этой группе и сохранить резерв на обязательные платежи."
+    from app.services.gemini_service import gemini_dashboard_advice
+
+    facts = (
+        f"Месяц: {month_label(latest_period)}. Доходы за месяц: {currency(month_totals['inc'])}. "
+        f"Расходы за месяц: {currency(month_totals['exp'])}. "
+        f"Крупнейшая категория расходов: {row['category']}, сумма {currency(row['total_expense'])}."
+    )
+    if ml_summary:
+        facts += (
+            f" Прогноз ML: в {ml_summary['month']} по «{ml_summary['topCategory']}» ожидается {ml_summary['predictedLabel']}."
+        )
+    ai = gemini_dashboard_advice(facts)
+    return ai if ai else fallback
 
 
 def budget_rows(user_id: int):
@@ -342,42 +435,54 @@ def budget_rows(user_id: int):
     return items
 
 
-def analytics_payload(user_id: int):
+def analytics_payload(user_id: int, date_from: str | None = None, date_to: str | None = None):
+    df, dt = _normalize_analytics_range(date_from, date_to)
+    frag, date_params = _analytics_date_sql_fragment(df, dt)
+    period_caption = "Сумма за выбранный интервал дат" if (df or dt) else "Сумма за весь период учёта"
+    period_description = "Все данные"
+    if df and dt:
+        period_description = f"{df} — {dt}"
+    elif df:
+        period_description = f"с {df}"
+    elif dt:
+        period_description = f"по {dt}"
+
+    base_params = [user_id, *date_params]
     with get_connection() as connection:
         totals = connection.execute(
-            """
+            f"""
             SELECT
                 COALESCE(SUM(CASE WHEN tx_type = 'income' THEN amount ELSE 0 END), 0) AS income_total,
                 COALESCE(SUM(CASE WHEN tx_type = 'expense' THEN amount ELSE 0 END), 0) AS expense_total,
                 COUNT(*) AS operations_total
             FROM transactions
-            WHERE user_id = ?
+            WHERE user_id = ?{frag}
             """,
-            (user_id,),
+            tuple(base_params),
         ).fetchone()
         by_category = connection.execute(
-            """
+            f"""
             SELECT category, SUM(amount) AS total_expense
             FROM transactions
-            WHERE user_id = ? AND tx_type = 'expense'
+            WHERE user_id = ? AND tx_type = 'expense'{frag}
             GROUP BY category
             ORDER BY total_expense DESC
             """,
-            (user_id,),
+            tuple(base_params),
         ).fetchall()
         monthly_rows = connection.execute(
-            """
+            f"""
             SELECT
                 substr(tx_date, 1, 7) AS month_key,
                 COALESCE(SUM(CASE WHEN tx_type = 'income' THEN amount ELSE 0 END), 0) AS income_total,
                 COALESCE(SUM(CASE WHEN tx_type = 'expense' THEN amount ELSE 0 END), 0) AS expense_total
             FROM transactions
-            WHERE user_id = ?
+            WHERE user_id = ?{frag}
             GROUP BY substr(tx_date, 1, 7)
             ORDER BY month_key DESC
             LIMIT 6
             """,
-            (user_id,),
+            tuple(base_params),
         ).fetchall()
 
     balance = totals["income_total"] - totals["expense_total"]
@@ -405,34 +510,103 @@ def analytics_payload(user_id: int):
             "expense": row["expense_total"],
             "incomeLabel": currency(row["income_total"]),
             "expenseLabel": currency(row["expense_total"]),
+            "barTitle": f"{month_label(row['month_key'])}: доход {currency(row['income_total'])}, расход {currency(row['expense_total'])}",
         }
         for row in reversed(monthly_rows)
     ]
 
     top_category = category_breakdown[0]["category"] if category_breakdown else "нет данных"
+    if df or dt:
+        insight_scope = f"Наибольшая доля расходов за выбранный период приходится на категорию «{top_category}»."
+        insight_balance = f"За выбранный период накоплено {currency(balance)} чистого остатка."
+        insight_ops = f"В выбранном интервале учтено {totals['operations_total']} операций."
+    else:
+        insight_scope = f"Наибольшая доля расходов за весь период учёта приходится на категорию «{top_category}»."
+        insight_balance = f"За весь период учёта накоплено {currency(balance)} чистого остатка."
+        insight_ops = f"В системе учтено {totals['operations_total']} операций пользователя."
+
+    insights_list = [insight_scope, insight_balance, insight_ops]
+    top3 = category_breakdown[:3]
+    cat_line = ", ".join(f"{c['category']} {c['amountLabel']} ({c['percent']}%)" for c in top3) if top3 else "нет категорий"
+    facts_analytics = (
+        f"Период: {period_description}. Доходы: {currency(totals['income_total'])}, расходы: {currency(totals['expense_total'])}, "
+        f"баланс: {currency(balance)}, операций: {totals['operations_total']}. Топ категорий расходов: {cat_line}."
+    )
+    from app.services.gemini_service import gemini_analytics_bullets
+
+    ai_bullets = gemini_analytics_bullets(facts_analytics)
+    if ai_bullets:
+        insights_list = ai_bullets
+
+    from app.ml.training import ml_retrain_readiness
 
     return {
+        "period": {
+            "dateFrom": df,
+            "dateTo": dt,
+            "description": period_description,
+        },
         "summaryCards": [
-            {"title": "Общий доход", "value": currency(totals['income_total']), "caption": "Сумма всех поступлений"},
-            {"title": "Общий расход", "value": currency(totals['expense_total']), "caption": "Сумма всех списаний"},
+            {"title": "Общий доход", "value": currency(totals['income_total']), "caption": period_caption},
+            {"title": "Общий расход", "value": currency(totals['expense_total']), "caption": period_caption},
             {"title": "Баланс", "value": currency(balance), "caption": "Разница между доходом и расходом"},
             {"title": "Норма сбережений", "value": f"{savings_rate}%", "caption": "Доля сохранённых средств"},
         ],
         "categoryBreakdown": category_breakdown,
         "monthlyTrend": monthly_trend,
         "mlOverview": ml_overview,
-        "insights": [
-            f"Наибольшая доля расходов приходится на категорию «{top_category}».",
-            f"За весь период сохранено {currency(balance)} чистого остатка.",
-            f"В системе уже обработано {totals['operations_total']} операций пользователя.",
-        ],
+        "mlRetrain": ml_retrain_readiness(),
+        "insights": insights_list,
     }
 
 
-def get_transactions_payload(user_id: int, search: str = "", category: str = "all"):
-    rows = fetch_transactions_for_user(user_id, search=search, category=category)
-    income_total = sum(row["amount"] for row in rows if row["tx_type"] == "income")
-    expense_total = sum(row["amount"] for row in rows if row["tx_type"] == "expense")
+def _user_transactions_totals(user_id: int):
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN tx_type = 'income' THEN amount ELSE 0 END), 0) AS income_total,
+                COALESCE(SUM(CASE WHEN tx_type = 'expense' THEN amount ELSE 0 END), 0) AS expense_total
+            FROM transactions
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+    return row["income_total"], row["expense_total"]
+
+
+def _user_transaction_categories(user_id: int):
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT category
+            FROM transactions
+            WHERE user_id = ?
+            ORDER BY category ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [row["category"] for row in rows]
+
+
+def get_transactions_payload(
+    user_id: int,
+    search: str = "",
+    category: str = "all",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    rows = fetch_transactions_for_user(
+        user_id,
+        search=search,
+        category=category,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    income_total, expense_total = _user_transactions_totals(user_id)
+    from_db = _user_transaction_categories(user_id)
+    default_cats = {name for name, _ in DEFAULT_BUDGETS} | {"Health", "Education", "Shopping"}
+    categories = sorted(set(from_db) | default_cats)
     return {
         "items": [serialize_transaction(row) for row in rows],
         "summary": {
@@ -440,7 +614,7 @@ def get_transactions_payload(user_id: int, search: str = "", category: str = "al
             "incomeLabel": currency(income_total),
             "expenseLabel": currency(expense_total),
         },
-        "categories": sorted({row["category"] for row in rows if row["category"] != "Income"}),
+        "categories": [c for c in categories if c != "Income"],
     }
 
 
@@ -454,22 +628,48 @@ def create_transaction_payload(user_id: int, payload):
     except ValueError as error:
         raise HTTPException(status_code=400, detail="Дата должна быть в формате YYYY-MM-DD") from error
 
+    category = payload.category
+    if transaction_type == "expense":
+        try:
+            from app.schemas import MLClassifyPayload
+            from app.services.ml_service import classify_expense_payload
+
+            ml = classify_expense_payload(
+                MLClassifyPayload(
+                    title=payload.title,
+                    amount=payload.amount,
+                    transaction_date=payload.transaction_date,
+                    note=payload.note,
+                )
+            )
+            if ml.get("status") == "ready" and ml.get("predictedCategory"):
+                conf = ml.get("confidence")
+                if conf is None or float(conf) >= 0.2:
+                    category = ml["predictedCategory"]
+        except Exception:
+            pass
+
+    income_src = ""
+    if transaction_type == "income":
+        income_src = (payload.income_source or "").strip()[:80]
+
     with get_connection() as connection:
         row = connection.execute(
             """
-            INSERT INTO transactions (user_id, title, category, tx_type, amount, tx_date, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO transactions (user_id, title, category, tx_type, amount, tx_date, note, created_at, income_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
             """,
             (
                 user_id,
                 payload.title,
-                payload.category,
+                category,
                 transaction_type,
                 payload.amount,
                 payload.transaction_date,
                 payload.note,
                 datetime.utcnow().isoformat(),
+                income_src,
             ),
         )
         row = row.fetchone()
@@ -511,13 +711,30 @@ def save_budget_payload(user_id: int, payload):
     return {"items": budget_rows(user_id), "message": "Бюджет сохранён"}
 
 
-def get_dashboard_payload(user_id: int):
-    transactions = fetch_transactions_for_user(user_id)
+def get_dashboard_payload(
+    user_id: int,
+    search: str = "",
+    category: str = "all",
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    from app.ml.training import ml_retrain_readiness
+
+    df, dt = _normalize_analytics_range(date_from, date_to)
+    rows = fetch_transactions_for_user(
+        user_id,
+        search=search,
+        category=category,
+        date_from=date_from,
+        date_to=date_to,
+    )
     return {
         "summaryCards": dashboard_summary_cards(user_id),
         "cashflow": dashboard_cashflow(user_id),
         "insight": dashboard_insight(user_id),
         "budgets": dashboard_budgets(user_id),
         "mlForecast": ml_forecast_summary(user_id),
-        "transactions": [serialize_transaction(row) for row in transactions[:4]],
+        "mlRetrain": ml_retrain_readiness(),
+        "transactions": [serialize_transaction(row) for row in rows[:20]],
+        "listFilters": {"search": search, "category": category, "dateFrom": df, "dateTo": dt},
     }

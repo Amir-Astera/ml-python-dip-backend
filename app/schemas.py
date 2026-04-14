@@ -19,6 +19,8 @@ class TransactionPayload(BaseModel):
     amount: float = Field(gt=0)
     transaction_date: str
     note: str = Field(default="", max_length=200)
+    # только для дохода: откуда деньги (зарплата, фриланс…)
+    income_source: str = Field(default="", max_length=80)
 
 
 class MLClassifyPayload(BaseModel):

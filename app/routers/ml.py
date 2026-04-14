@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.dependencies import get_current_user
 from app.schemas import MLClassifyPayload
+from app.ml.training import ml_retrain_readiness
 from app.services.ml_service import classify_expense_payload, retrain_ml_payload, user_ml_overview_payload
 
 router = APIRouter(prefix='/ml', tags=['ml'])
@@ -15,6 +16,11 @@ def ml_overview(current_user=Depends(get_current_user)):
 @router.post('/classify-expense')
 def classify_expense(payload: MLClassifyPayload, current_user=Depends(get_current_user)):
     return classify_expense_payload(payload)
+
+
+@router.get('/retrain-info')
+def retrain_info(current_user=Depends(get_current_user)):
+    return ml_retrain_readiness()
 
 
 @router.post('/retrain')

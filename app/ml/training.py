@@ -355,6 +355,29 @@ def train_ml_models(force: bool = False):
     return metrics
 
 
+def ml_retrain_readiness() -> dict:
+    """Условия те же, что при обучении: классификатор и прогноз по разным порогам."""
+    rows = _load_real_rows()
+    stats = _dataset_stats(rows)
+    x_cls, y_cls = _build_classifier_dataset(rows)
+    cc = Counter(y_cls)
+    ok_cls = len(x_cls) >= 12 and len(cc) >= 2 and bool(cc) and min(cc.values()) >= 2
+    x_fc, y_fc = _build_forecast_dataset(rows)
+    ok_fc = len(x_fc) >= 8
+    hints = []
+    if not ok_cls:
+        hints.append("Классификатор: нужно ≥12 расходов, ≥2 категории, в каждой ≥2 операции.")
+    if not ok_fc:
+        hints.append("Прогноз: нужна история расходов по месяцам (модель строит цепочку из месяцев).")
+    return {
+        "classifierReady": ok_cls,
+        "forecastReady": ok_fc,
+        "canRetrain": ok_cls or ok_fc,
+        "dataset": stats,
+        "hints": hints,
+    }
+
+
 def load_classifier():
     metrics = load_metrics()
     if metrics.get('dataset', {}).get('source') != REAL_DATASET_SOURCE:

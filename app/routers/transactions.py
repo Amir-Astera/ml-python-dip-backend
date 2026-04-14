@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Query
 
 from app.dependencies import get_current_user
@@ -11,9 +13,17 @@ router = APIRouter(tags=['transactions'])
 def get_transactions(
     search: str = Query(default=''),
     category: str = Query(default='all'),
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
     current_user=Depends(get_current_user),
 ):
-    return get_transactions_payload(current_user['id'], search=search, category=category)
+    return get_transactions_payload(
+        current_user['id'],
+        search=search,
+        category=category,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
 @router.post('/transactions')
